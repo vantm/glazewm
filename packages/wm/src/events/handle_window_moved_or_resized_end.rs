@@ -1,24 +1,20 @@
 use anyhow::Context;
+use tracing::info;
+use uuid::Uuid;
 use wm_common::{
-  try_warn, FullscreenStateConfig, TilingDirection, WindowState,
+  ActiveDragOperation, FullscreenStateConfig, TilingDirection, WindowState, try_warn,
 };
 use wm_platform::{LengthValue, Point, Rect};
 
 use crate::{
   commands::{
-    container::{move_container_within_tree, wrap_in_split_container},
-    window::{set_window_size, update_window_state},
-  },
-  events::update_floating_window_position,
-  models::{
+    container::{move_container_within_tree, wrap_in_split_container}, monitor::find_monitor_by_anchor_point, window::{move_window_to_workspace, resize_window, run_window_rules, set_window_size, update_window_state},
+  }, events::update_floating_window_position, models::{
     DirectionContainer, NonTilingWindow, SplitContainer, TilingContainer,
     WindowContainer,
-  },
-  traits::{
+  }, traits::{
     CommonGetters, PositionGetters, TilingDirectionGetters, WindowGetters,
-  },
-  user_config::UserConfig,
-  wm_state::WmState,
+  }, user_config::UserConfig, wm_state::WmState,
 };
 
 /// Handles the event for when a window is finished being moved or resized
@@ -119,6 +115,14 @@ pub fn handle_window_moved_or_resized_end(
         window.as_window_container()?
       );
 
+      if let Err(e) = try_arrange_window_between_monitors(
+        &window.as_window_container()?,
+        state,
+        config,
+      ) {
+        info!("Skipping monitor arrangement due to: {e:#}");
+      }
+
       let frame = window.native_properties().frame;
 
       // Update the window's size based on the new frame position. This
@@ -142,6 +146,115 @@ pub fn handle_window_moved_or_resized_end(
       state.pending_sync.queue_container_to_redraw(window.clone());
     }
   }
+
+  Ok(())
+}
+
+fn move_window_to_position(
+  window: &WindowContainer,
+  position: &Point,
+  state: &mut WmState,
+  config: &UserConfig,
+) -> anyhow::Result<()> {
+  let mouse_workspace = state
+    .monitor_at_point(position)
+    .and_then(|monitor| monitor.displayed_workspace())
+    .or_else(|| window.workspace())
+    .context("No workspace.")?;
+
+  // Get the workspace, split containers, and other windows under the
+  // dragged window.
+  let containers_at_pos = state
+    .containers_at_point(&mouse_workspace.clone().into(), &position)
+    .into_iter()
+    .filter(|container| container.id() != window.id());
+
+  // Get the deepest direction container under the dragged window.
+  let target_parent: DirectionContainer = containers_at_pos
+    .filter_map(|container| container.as_direction_container().ok())
+    .fold(mouse_workspace.into(), |acc, container| {
+      if container.ancestors().count() > acc.ancestors().count() {
+        container
+      } else {
+        acc
+      }
+    });
+
+  // If the target parent has no children (i.e. an empty workspace), then
+  // just do nothing.
+  if target_parent.tiling_children().count() == 0 {
+    return Ok(());
+  }
+
+  let nearest_container = target_parent
+    .children()
+    .into_iter()
+    .filter_map(|container| container.as_tiling_container().ok())
+    .try_fold(None, |acc: Option<TilingContainer>, container| match acc {
+      Some(acc) => {
+        let is_nearer = acc.to_rect()?.distance_to_point(&position)
+          < container.to_rect()?.distance_to_point(&position);
+
+        anyhow::Ok(Some(if is_nearer { acc } else { container }))
+      }
+      None => Ok(Some(container)),
+    })?
+    .context("No nearest container.")?;
+
+  let tiling_direction = target_parent.tiling_direction();
+  let drop_position =
+    drop_position(&position, &nearest_container.to_rect()?);
+
+  let should_split = nearest_container.is_tiling_window()
+    && match tiling_direction {
+      TilingDirection::Horizontal => {
+        drop_position == DropPosition::Top
+          || drop_position == DropPosition::Bottom
+      }
+      TilingDirection::Vertical => {
+        drop_position == DropPosition::Left
+          || drop_position == DropPosition::Right
+      }
+    };
+
+  if should_split {
+    let split_container = SplitContainer::new(
+      tiling_direction.inverse(),
+      config.value.gaps.clone(),
+    );
+
+    wrap_in_split_container(
+      &split_container,
+      &target_parent.clone().into(),
+      &[nearest_container],
+    )?;
+
+    let target_index = match drop_position {
+      DropPosition::Top | DropPosition::Left => 0,
+      _ => 1,
+    };
+
+    move_container_within_tree(
+      &window.clone().into(),
+      &split_container.into(),
+      target_index,
+      state,
+    )?;
+  } else {
+    let target_index = match drop_position {
+      DropPosition::Top | DropPosition::Left => nearest_container.index(),
+      _ => nearest_container.index() + 1,
+    };
+
+    move_container_within_tree(
+      &window.clone().into(),
+      &target_parent.clone().into(),
+      target_index,
+      state,
+    )?;
+  }
+
+  state.pending_sync.queue_container_to_redraw(target_parent);
 
   Ok(())
 }
@@ -316,4 +429,51 @@ fn drop_position(mouse_pos: &Point, rect: &Rect) -> DropPosition {
       DropPosition::Top
     }
   }
+}
+
+fn try_arrange_window_between_monitors(
+  window: &WindowContainer,
+  state: &mut WmState,
+  config: &UserConfig,
+) -> anyhow::Result<()> {
+  let root = &state.root_container;
+  if root.monitors().len() < 2 {
+    return Ok(());
+  }
+
+  let anchor = state.dispatcher.cursor_position()?;
+
+  find_monitor_by_anchor_point(root, &anchor)?
+    .and_then(|target| window.monitor().map(|current| (target, current)))
+    .and_then(|(target, current)| {
+      if target.id() == current.id() {
+        None
+      } else {
+        Some(target)
+      }
+    })
+    .and_then(|target| {
+      target
+        .workspaces()
+        .iter()
+        .find(|x| x.is_displayed())
+        .cloned()
+    })
+    .map(|workspace| {
+      move_window_to_workspace(
+        window.clone(),
+        crate::models::WorkspaceTarget::Name(workspace.config().name),
+        state,
+        config,
+      )
+      .and_then(|_| {
+        if let Ok(mouse_pos) = state.dispatcher.cursor_position() {
+          move_window_to_position(window, &mouse_pos, state, config)?
+        }
+        window.set_has_pending_dpi_adjustment(true);
+        Ok(())
+      })
+    })
+    .transpose()
+    .map(|_| ())
 }
