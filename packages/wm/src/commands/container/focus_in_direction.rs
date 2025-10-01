@@ -1,10 +1,12 @@
 use anyhow::Context;
-use wm_common::{Direction, TilingDirection, WindowState};
+use wm_common::{Direction, Point, TilingDirection, WindowState};
 
 use super::set_focused_descendant;
 use crate::{
   models::{Container, TilingContainer},
-  traits::{CommonGetters, TilingDirectionGetters, WindowGetters},
+  traits::{
+    CommonGetters, PositionGetters, TilingDirectionGetters, WindowGetters,
+  },
   wm_state::WmState,
 };
 
@@ -25,7 +27,12 @@ pub fn focus_in_direction(
     Container::NonTilingWindow(ref non_tiling_window) => {
       match non_tiling_window.state() {
         WindowState::Floating(_) => {
-          floating_focus_target(origin_container, direction)
+          match floating_focus_target(origin_container, direction) {
+            Some(focus_target) => Some(focus_target),
+            None => {
+              workspace_focus_target(origin_container, direction, state)?
+            }
+          }
         }
         WindowState::Fullscreen(_) => {
           workspace_focus_target(origin_container, direction, state)?
@@ -58,21 +65,53 @@ fn floating_focus_target(
     })
   };
 
-  let mut floating_siblings =
-    origin_container.siblings().filter(is_floating);
+  // let mut floating_siblings =
+  //   origin_container.siblings().filter(is_floating);
+
+  let get_pos = |c: &Container| {
+    c.to_rect()
+      .map(|r| Point::from_xy(r.x(), r.y()))
+      .unwrap_or(Point::min())
+  };
+
+  let origin_position = get_pos(origin_container);
+
+  let mut floating_siblings_with_position: Vec<_> = origin_container
+    .self_and_siblings()
+    .filter(|s| s.id() != origin_container.id())
+    .filter(is_floating)
+    .map(|s| (s.clone(), get_pos(&s.clone())))
+    .collect();
+
+  match direction {
+    Direction::Left | Direction::Right => {
+      floating_siblings_with_position.sort_by(|a, b| a.1.x.cmp(&b.1.x));
+    }
+    Direction::Up | Direction::Down => {
+      floating_siblings_with_position.sort_by(|a, b| a.1.y.cmp(&b.1.y));
+    }
+  }
 
   // Wrap if next/previous floating window is not found.
   match direction {
-    Direction::Left => origin_container
-      .next_siblings()
-      .find(is_floating)
-      .or_else(|| floating_siblings.last()),
-    Direction::Right => origin_container
-      .prev_siblings()
-      .find(is_floating)
-      .or_else(|| floating_siblings.next()),
-    // Cannot focus vertically from a floating window.
-    _ => None,
+    Direction::Left => floating_siblings_with_position
+      .into_iter()
+      .filter(|(_, p)| p.x < origin_position.x)
+      .map(|(s, _)| s.clone())
+      .last(),
+    Direction::Right => floating_siblings_with_position
+      .into_iter()
+      .find(|(_, p)| p.x > origin_position.x)
+      .map(|(s, _)| s.clone()),
+    Direction::Up => floating_siblings_with_position
+      .into_iter()
+      .filter(|(_, p)| p.y < origin_position.y)
+      .map(|(s, _)| s.clone())
+      .last(),
+    Direction::Down => floating_siblings_with_position
+      .into_iter()
+      .find(|(_, p)| p.y > origin_position.y)
+      .map(|(s, _)| s.clone()),
   }
 }
 
@@ -154,6 +193,14 @@ fn workspace_focus_target(
     });
 
   let focus_target = focused_fullscreen
+    .or_else(|| {
+      target_workspace.as_ref().and_then(|w| {
+        w.child_focus_order()
+          .next()
+          .and_then(|c| c.as_non_tiling_window().cloned())
+          .map(Into::into)
+      })
+    })
     .or_else(|| {
       target_workspace.as_ref().and_then(|workspace| {
         workspace
