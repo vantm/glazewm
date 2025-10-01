@@ -16,4 +16,17 @@ impl Point {
     #[allow(clippy::cast_precision_loss)]
     ((dx * dx + dy * dy) as f32).sqrt()
   }
+
+  #[must_use]
+  pub fn from_xy(x: i32, y: i32) -> Self {
+    Self { x, y }
+  }
+
+  #[must_use]
+  pub fn min() -> Self {
+    Self {
+      x: i32::MIN,
+      y: i32::MIN,
+    }
+  }
 }
