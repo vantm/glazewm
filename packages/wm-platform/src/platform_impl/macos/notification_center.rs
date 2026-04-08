@@ -11,6 +11,7 @@ use objc2_app_kit::{
   NSWorkspaceDidLaunchApplicationNotification,
   NSWorkspaceDidTerminateApplicationNotification,
   NSWorkspaceDidUnhideApplicationNotification,
+  NSWorkspaceDidWakeNotification, NSWorkspaceWillSleepNotification,
 };
 use objc2_foundation::{
   ns_string, NSNotification, NSNotificationCenter, NSNotificationName,
@@ -27,6 +28,8 @@ pub(crate) enum NotificationName {
   WorkspaceDidTerminateApplication,
   WorkspaceDidHideApplication,
   WorkspaceDidUnhideApplication,
+  WorkspaceDidWake,
+  WorkspaceWillSleep,
   ApplicationDidChangeScreenParameters,
 }
 
@@ -53,6 +56,10 @@ impl From<&NSNotificationName> for NotificationName {
       == unsafe { NSWorkspaceDidUnhideApplicationNotification }
     {
       Self::WorkspaceDidUnhideApplication
+    } else if name == unsafe { NSWorkspaceDidWakeNotification } {
+      Self::WorkspaceDidWake
+    } else if name == unsafe { NSWorkspaceWillSleepNotification } {
+      Self::WorkspaceWillSleep
     } else if name
       == unsafe { NSApplicationDidChangeScreenParametersNotification }
     {
@@ -84,6 +91,12 @@ impl From<NotificationName> for &NSString {
       NotificationName::WorkspaceDidUnhideApplication => unsafe {
         NSWorkspaceDidUnhideApplicationNotification
       },
+      NotificationName::WorkspaceDidWake => unsafe {
+        NSWorkspaceDidWakeNotification
+      },
+      NotificationName::WorkspaceWillSleep => unsafe {
+        NSWorkspaceWillSleepNotification
+      },
       NotificationName::ApplicationDidChangeScreenParameters => unsafe {
         NSApplicationDidChangeScreenParametersNotification
       },
@@ -100,6 +113,8 @@ pub(crate) enum NotificationEvent {
   WorkspaceDidTerminateApplication(Retained<NSRunningApplication>),
   WorkspaceDidHideApplication(Retained<NSRunningApplication>),
   WorkspaceDidUnhideApplication(Retained<NSRunningApplication>),
+  WorkspaceWillSleep,
+  WorkspaceDidWake,
   ApplicationDidChangeScreenParameters,
 }
 
@@ -141,7 +156,7 @@ impl NotificationObserver {
   fn handle_event(&self, notif: &NSNotification) {
     tracing::debug!("Received notification: {notif:#?}");
 
-    match NotificationName::from(unsafe { &*notif.name() }) {
+    match NotificationName::from(&*notif.name()) {
       NotificationName::WorkspaceActiveSpaceDidChange => {
         self.emit_event(NotificationEvent::WorkspaceActiveSpaceDidChange);
       }
@@ -192,6 +207,12 @@ impl NotificationObserver {
           );
         }
       }
+      NotificationName::WorkspaceDidWake => {
+        self.emit_event(NotificationEvent::WorkspaceDidWake);
+      }
+      NotificationName::WorkspaceWillSleep => {
+        self.emit_event(NotificationEvent::WorkspaceWillSleep);
+      }
       NotificationName::ApplicationDidChangeScreenParameters => {
         self.emit_event(
           NotificationEvent::ApplicationDidChangeScreenParameters,
@@ -215,14 +236,13 @@ pub(crate) struct NotificationCenter {
 
 impl NotificationCenter {
   pub fn workspace_center() -> Self {
-    let center =
-      unsafe { NSWorkspace::sharedWorkspace().notificationCenter() };
+    let center = NSWorkspace::sharedWorkspace().notificationCenter();
 
     Self { inner: center }
   }
 
   pub fn default_center() -> Self {
-    let center = unsafe { NSNotificationCenter::defaultCenter() };
+    let center = NSNotificationCenter::defaultCenter();
 
     Self { inner: center }
   }

@@ -9,6 +9,8 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![feature(iterator_try_collect)]
 
+#[cfg(target_os = "macos")]
+use std::io::IsTerminal;
 use std::{env, path::PathBuf, process, time::Duration};
 
 use anyhow::{Context, Error};
@@ -42,6 +44,9 @@ mod traits;
 mod user_config;
 mod wm;
 mod wm_state;
+
+#[cfg(test)]
+mod test_utils;
 
 /// Main entry point for the application.
 ///
@@ -125,8 +130,8 @@ async fn start_wm(
 
   let mut ipc_server = IpcServer::start().await?;
 
-  // Start watcher process for restoring hidden windows on crash.
-  // Windows-only, since macOS' hidden windows remain accessible.
+  // On Windows, start watcher process for restoring hidden windows on
+  // crash. macOS' hidden windows are always accessible.
   #[cfg(target_os = "windows")]
   if let Err(err) = start_watcher_process() {
     tracing::warn!(
@@ -135,6 +140,14 @@ async fn start_wm(
         .then_some(".\n Run `cargo build -p wm-watcher` to build it.")
         .unwrap_or_default()
     );
+  }
+
+  // On macOS, update the current process' PATH variable so that
+  // `shell-exec` can resolve programs defined in the shell's PATH. Skip if
+  // running via a terminal.
+  #[cfg(target_os = "macos")]
+  if !std::io::stdin().is_terminal() {
+    update_path_env();
   }
 
   // Start listening for platform events after populating initial state.
@@ -157,14 +170,19 @@ async fn start_wm(
   )?;
 
   // Run user's startup commands.
-  wm.process_commands(
+  if let Err(err) = wm.process_commands(
     &config.value.general.startup_commands.clone(),
     None,
     &mut config,
-  )?;
+  ) {
+    tracing::error!("{:?}", err);
+    dispatcher.show_error_dialog("Non-fatal error", &err.to_string());
+  }
 
   // Create an interval for periodically cleaning up invalid windows.
   let mut cleanup_interval = tokio::time::interval(Duration::from_secs(5));
+  cleanup_interval
+    .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
   loop {
     let res = tokio::select! {
@@ -225,10 +243,9 @@ async fn start_wm(
       Some(wm_event) = wm.event_rx.recv() => {
         tracing::debug!("Received WM event: {:?}", wm_event);
 
-        // Disable mouse and keybinding listeners when the WM is paused.
+        // Disable mouse listener when the WM is paused.
         if let WmEvent::PauseChanged { is_paused } = wm_event {
           let _ = mouse_listener.enable(!is_paused);
-          keybinding_listener.enable(!is_paused);
         }
 
         // Update keybinding and mouse listeners on config changes.
@@ -236,6 +253,7 @@ async fn start_wm(
           wm_event,
           WmEvent::UserConfigChanged { .. }
             | WmEvent::BindingModesChanged { .. }
+            | WmEvent::PauseChanged { .. }
         ) {
           keybinding_listener.update(
             &config
@@ -330,4 +348,38 @@ fn start_watcher_process() -> anyhow::Result<tokio::process::Child, Error>
   Command::new(&watcher_path)
     .spawn()
     .context("Failed to start watcher process.")
+}
+
+/// Updates the current process' PATH by querying the login shell.
+///
+/// Apps launched outside a terminal (Spotlight, Finder, login items)
+/// inherit a PATH that only contains `/usr/bin:/bin:/usr/sbin:/sbin`. This
+/// causes `shell-exec` to fail for binaries that aren't in the system
+/// PATH.
+#[cfg(target_os = "macos")]
+fn update_path_env() {
+  let shell =
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+
+  // Use `-l` and `-i` (login + interactive) so that both profile and rc
+  // files are sourced.
+  let path_var = match std::process::Command::new(&shell)
+    .args(["-lic", "printf '%s' \"$PATH\""])
+    .output()
+  {
+    Ok(output) if output.status.success() => {
+      String::from_utf8(output.stdout)
+        .ok()
+        .filter(|path| !path.is_empty())
+    }
+    _ => None,
+  };
+
+  if let Some(path) = path_var {
+    std::env::set_var("PATH", path);
+  } else {
+    tracing::warn!(
+      "Failed to query login shell for PATH. Keeping existing PATH."
+    );
+  }
 }

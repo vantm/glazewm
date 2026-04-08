@@ -8,7 +8,7 @@ use objc2_application_services::{AXError, AXValue};
 use objc2_core_foundation::{
   CFBoolean, CFRetained, CFString, CGPoint, CGSize,
 };
-use objc2_core_graphics::CGError;
+use objc2_core_graphics::{CGDisplayIsAsleep, CGError};
 
 use crate::{
   platform_impl::{
@@ -102,8 +102,28 @@ impl NativeWindow {
     self
       .element
       .with(|el| match el.get_attribute::<CFString>("AXRole") {
-        Err(crate::Error::Accessibility(_, code)) => {
-          code != AXError::InvalidUIElement.0
+        Err(crate::Error::Accessibility(_, code))
+          if code == AXError::InvalidUIElement.0 =>
+        {
+          let has_login_window = NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .and_then(|app| app.bundleIdentifier())
+            .is_some_and(|id| id.to_string() == "com.apple.loginwindow");
+
+          // AX calls transiently fail with `InvalidUIElement` during
+          // sleep/wake. The window should still be considered valid.
+          //
+          // Events during sleep:
+          //   1. Display goes asleep.
+          //   2. AX calls fail with `InvalidUIElement`.
+          //   3. Login window activates.
+          //
+          // Events during wake:
+          //   1. Display wakes up.
+          //   2. Login window deactivates and AX calls succeed again.
+          //
+          // Perf: `CGDisplayIsAsleep` ~1-5µs, login window check ~1-2ms.
+          CGDisplayIsAsleep(0) || has_login_window
         }
         _ => true,
       })
@@ -256,8 +276,7 @@ impl NativeWindow {
       // Get whether enhanced UI is currently enabled.
       let was_enabled = app_el
         .get_attribute::<CFBoolean>("AXEnhancedUserInterface")
-        .map(|cf_bool| cf_bool.value())
-        .unwrap_or(false);
+        .is_ok_and(|cf_bool| cf_bool.value());
 
       // Disable enhanced UI if it was enabled.
       if was_enabled {
@@ -340,7 +359,7 @@ impl NativeWindow {
   ) -> crate::Result<()> {
     // Ref: https://github.com/Hammerspoon/hammerspoon/issues/370#issuecomment-545545468
     let window_id = self.id.0.to_ne_bytes();
-    let mut event1 = [0u8; 0xf8];
+    let mut event1 = [0; 0x100];
     event1[0x04] = 0xf8;
     event1[0x08] = 0x01;
     event1[0x3a] = 0x10;
@@ -441,7 +460,7 @@ pub(crate) fn focused_window(
   dispatcher: &Dispatcher,
 ) -> crate::Result<crate::NativeWindow> {
   dispatcher
-    .dispatch_sync(|| unsafe {
+    .dispatch_sync(|| {
       // Get the frontmost (active) application.
       let frontmost_app = NSWorkspace::sharedWorkspace()
         .frontmostApplication()
@@ -466,11 +485,9 @@ pub(crate) fn reset_focus(dispatcher: &Dispatcher) -> crate::Result<()> {
     ));
   };
 
-  let success = unsafe {
-    application.ns_app.activateWithOptions(
-      NSApplicationActivationOptions::ActivateAllWindows,
-    )
-  };
+  let success = application.ns_app.activateWithOptions(
+    NSApplicationActivationOptions::ActivateAllWindows,
+  );
 
   if !success {
     return Err(crate::Error::Platform(

@@ -82,13 +82,13 @@ impl EventLoopSource {
 
       // `stop()` only takes effect after processing a subsequent UI event.
       // Post a dummy event so the application actually exits.
-      unsafe { ns_app.abortModal() };
+      ns_app.abortModal();
 
       let _ = result_tx.send(());
     })?;
 
     result_rx
-      .recv_timeout(std::time::Duration::from_millis(3000))
+      .recv_timeout(std::time::Duration::from_secs(3))
       .map_err(crate::Error::ChannelRecv)
   }
 }
